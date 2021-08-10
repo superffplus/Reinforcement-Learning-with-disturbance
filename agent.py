@@ -1,6 +1,9 @@
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.autograd as autograd
 import rollouts
 
 from abc import abstractmethod
@@ -67,7 +70,7 @@ class Agent:
         :param ob: observation of the environment
         :return: the probability of actions, and optimal action
         """
-        ob = torch.as_tensor(ob).to(self.device)
+        ob = torch.as_tensor(ob, dtype=torch.float32).to(self.device)
         actions = self.act_model(ob)
         # optimal_action = torch.argmax(actions, dim=1)
         return actions
@@ -191,11 +194,11 @@ class PPOAgent(Agent):
 
     def learn(self, rollout: rollouts.Replay):
         states, actions, old_pis, advantages, returns = rollout.sample(batch_size=64)
-        state_tensor = torch.as_tensor(states, dtype=torch.float32)
-        action_tensor = torch.as_tensor(actions, dtype=torch.long)
-        old_pi_tensor = torch.as_tensor(old_pis, dtype=torch.float32)
-        advantage_tensor = torch.as_tensor(advantages, dtype=torch.float32)
-        return_tensor = torch.as_tensor(returns, dtype=torch.float32)
+        state_tensor = torch.as_tensor(states, dtype=torch.float32).to(self.device)
+        action_tensor = torch.as_tensor(actions, dtype=torch.long).to(self.device)
+        old_pi_tensor = torch.as_tensor(old_pis, dtype=torch.float32).to(self.device)
+        advantage_tensor = torch.as_tensor(advantages, dtype=torch.float32).to(self.device)
+        return_tensor = torch.as_tensor(returns, dtype=torch.float32).to(self.device)
 
         new_pi_tensor = self.step(state_tensor)
         pi_tensor = torch.gather(new_pi_tensor, 1, action_tensor.unsqueeze(1)).squeeze(1)
@@ -215,3 +218,91 @@ class PPOAgent(Agent):
         self.value_optimizer.zero_grad()
         critic_loss.backward()
         self.value_optimizer.step()
+        
+        
+class TRPOAgent(Agent):
+    def __init__(self, ob_space, act_space, params, device='cpu'):
+        super(TRPOAgent, self).__init__(ob_space, act_space, params, device)
+        self.max_kl = 0.01
+
+    def learn(self, rollout: rollouts.Replay):
+        states, actions, old_pis, advantages, returns = rollout.sample(batch_size=64)
+        state_tensor = torch.as_tensor(states, dtype=torch.float32).to(self.device)
+        action_tensor = torch.as_tensor(actions, dtype=torch.long).to(self.device)
+        old_pi_tensor = torch.as_tensor(old_pis, dtype=torch.float32).to(self.device)
+        advantage_tensor = torch.as_tensor(advantages, dtype=torch.float32).to(self.device)
+        return_tensor = torch.as_tensor(returns, dtype=torch.float32).to(self.device)
+
+        new_pi_tensor = self.step(state_tensor)
+        pi_tensor = torch.gather(new_pi_tensor, 1, action_tensor.unsqueeze(1)).squeeze(1)
+        surrogate_tensor = (pi_tensor / old_pi_tensor) * advantage_tensor
+        loss_tensor = surrogate_tensor.mean()
+        loss_grads = autograd.grad(loss_tensor, self.act_model.parameters())
+        loss_grad = torch.cat([grad.view(-1) for grad in loss_grads]).detach()
+
+        # calculate conjugate gradient: Fx=g
+        def f(x):
+            prob_tensor = self.act_model(state_tensor)
+            prob_old_tensor = prob_tensor.detach()
+            # the values of prob_old_tensor and prob_tensor are the same
+            kld_tensor = (prob_old_tensor * torch.log(prob_old_tensor/prob_tensor).clamp(1e-6, 1e6)).sum(axis=1)
+            kld_loss_tensor = kld_tensor.mean()
+            grads = autograd.grad(kld_loss_tensor, self.act_model.parameters(), create_graph=True)
+            flatten_grad_tensor = torch.cat([grad.view(-1) for grad in grads])
+            grad_matmul_x = torch.dot(flatten_grad_tensor, x)
+            grad_grads = autograd.grad(grad_matmul_x, self.act_model.parameters())
+            flatten_grad_grad = torch.cat([grad.contiguous().view(-1) for grad in grad_grads]).detach()
+            fx = flatten_grad_grad + x * 0.01
+            return fx
+        x, fx = self.conjugate_gradient(f, loss_grad)
+        natural_gradient_tensor = torch.sqrt(2 * self.max_kl / torch.dot(fx, x)) * x
+
+        def set_actor_net_params(flatten_params):
+            begin = 0
+            for param in self.act_model.parameters():
+                end = begin + param.numel()
+                param.data.copy_(flatten_params[begin:end].view(param.size()))
+                begin = end
+
+        old_param = torch.cat([param.view(-1) for param in self.act_model.parameters()])
+        expected_improve = torch.dot(loss_grad, natural_gradient_tensor)
+
+        for learning_step in [0.,] + [.5 ** j in range(10)]:
+            new_param = old_param + learning_step * natural_gradient_tensor
+            set_actor_net_params(new_param)
+            all_pi_tensor = self.act_model(state_tensor)
+            new_pi_tensor = all_pi_tensor.gather(1, action_tensor.unsqueeze(1)).squeeze(1)
+            new_pi_tensor = new_pi_tensor.detach()
+            surrogate_tensor = (new_pi_tensor / pi_tensor) * advantage_tensor
+            objective = surrogate_tensor.mean().item()
+            if np.isclose(learning_step, 0.):
+                old_objective = objective
+            else:
+                if objective - old_objective > 0.1 * expected_improve * learning_step:
+                    break
+                else:
+                    set_actor_net_params(old_param)
+
+        pred_tensor = self.value_model(state_tensor)
+        critic_loss_tensor = self.value_loss(pred_tensor, return_tensor)
+        self.value_optimizer.zero_grad()
+        critic_loss_tensor.backward()
+        self.value_optimizer.step()
+
+    @staticmethod
+    def conjugate_gradient(f, b, iter_count=10, epsilon=1e-12, tol=1e-6):
+        x = b * 0.
+        r = b.clone()
+        p = b.clone()
+        rho = torch.dot(r, r)
+        for i in range(iter_count):
+            z = f(p)
+            alpha = rho / (torch.dot(p, z) + epsilon)
+            x += alpha * p
+            r -= alpha * z
+            rho_new = torch.dot(r, r)
+            p = r + (rho_new / rho) * p
+            rho = rho_new
+            if rho < tol:
+                break
+        return x, f(x)

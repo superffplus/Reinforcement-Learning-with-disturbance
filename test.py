@@ -1,21 +1,13 @@
 import torch
-import torch.nn as nn
+from agent import Agent
+import torch.autograd as autograd
 
-a = torch.tensor([[1., 2., 3.],
-                  [4., 5., 5]], requires_grad=True)
-b = torch.rand([6, 3],requires_grad=True)
-c = a.repeat(2, 1)
 
-e = torch.cat((a, c), dim=0)
-linear_drop = nn.Dropout(p=0.2)
-
-f = b * e
-f = linear_drop(f)
-h = f.mean()
-h.backward()
-
-print(a.grad)
-print(b.grad)
-print(c.grad)
-print(e.grad)
-
+model = Agent(6, 1, None)
+x = torch.rand([4, 6])
+y = model.value_model(x)
+aux = torch.rand([4, 1], requires_grad=True)
+result = (aux * y).mean()
+loss = autograd.grad(result, model.value_model.parameters())
+for learning_step in [0.,] + [.5 ** j for j in range(10)]:
+    print(learning_step)
