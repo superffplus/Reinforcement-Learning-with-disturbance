@@ -267,7 +267,7 @@ class TRPOAgent(Agent):
         old_param = torch.cat([param.view(-1) for param in self.act_model.parameters()])
         expected_improve = torch.dot(loss_grad, natural_gradient_tensor)
 
-        for learning_step in [0.,] + [.5 ** j in range(10)]:
+        for learning_step in [0.,] + [.5 ** j for j in range(10)]:
             new_param = old_param + learning_step * natural_gradient_tensor
             set_actor_net_params(new_param)
             all_pi_tensor = self.act_model(state_tensor)
