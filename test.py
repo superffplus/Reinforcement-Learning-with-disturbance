@@ -1,13 +1,13 @@
+import pandas as pd
 import torch
-from agent import Agent
-import torch.autograd as autograd
 
+a = [1, 2, 3, 4]
+b = [4, 5, 6, 1]
+c = [1, 2, 6, 6]
 
-model = Agent(6, 1, None)
-x = torch.rand([4, 6])
-y = model.value_model(x)
-aux = torch.rand([4, 1], requires_grad=True)
-result = (aux * y).mean()
-loss = autograd.grad(result, model.value_model.parameters())
-for learning_step in [0.,] + [.5 ** j for j in range(10)]:
-    print(learning_step)
+d = pd.DataFrame([a, b, c], columns=['a', 'b', 'c', 'd'])
+print(d)
+d['a'][2] = 7
+print(d)
+t = torch.tensor(d.values, dtype=torch.float32)
+print(t)
