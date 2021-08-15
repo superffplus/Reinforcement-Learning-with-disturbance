@@ -135,7 +135,7 @@ class Server:
 
 
 class ServerEnv(gym.Env):
-    def __init__(self, server_num, device_num, x_range, y_range, mode='all',
+    def __init__(self, server_num, device_num, x_range, y_range, mode='all', single_strategy='random',
                  max_frequency=1000, max_task_size=100, max_queue=10, rand_seed=0):
         self.server_num = server_num
         self.device_num = device_num
@@ -152,18 +152,28 @@ class ServerEnv(gym.Env):
         # mode = single means only the single device use the RL based decision making
         self.mode = mode
 
-        self.servers, self.devices, self.listen_queue = None, None, None
-        self.generated_tasks = []   # store tasks generated right now, and wait the offloading decision
+        # only be used in mode=single
+        # single strategy can be 'random' which means others devices offload task randomly,
+        # and it can also be 'nearest' which means other devices offload task to the nearest servers.
+        self.single_strategy = single_strategy
 
-        # variable to record the servers' states, including frequencies, remaining buffer size, location(x, y)
-        self.status_dataframe = pd.DataFrame(columns=['frequency', 'remain_buffer', 'pos_x', 'pos_y'])
+        self.servers, self.devices, self.listen_queue = None, None, None
+
+        # variable to record the servers' states, including [frequencies, remaining buffer size, location_x, location_y]
+        self.server_status = pd.DataFrame(columns=['frequency', 'remain_buffer', 'pos_x', 'pos_y'])
+        # variable to record the tasks' states, including [size, delay, location_x, location_y]
+        # if mode='single', record the task information of the single device only
+        self.indexes = [n for n in range(self.device_num) if self.mode == 'all' or n == 0]
+        self.task_status = pd.DataFrame(columns=['size', 'delay', 'pos_x', 'pos_y'], index=self.indexes)
+        self.generated_tasks = []  # store the generated tasks temporarily
+        # store the nearest servers of each device. this will only be used where mode='single'
+        self.nearest_servers_list = []
 
         self.reset()
 
     def reset(self):
         self.servers = []
         self.devices = []
-        self.generated_tasks = []
 
         # generate servers
         for i in range(self.server_num):
@@ -172,10 +182,10 @@ class ServerEnv(gym.Env):
             x_pos = random.uniform(-self.x_range, self.x_range)
             y_pos = random.uniform(-self.y_range, self.y_range)
             self.servers.append(Server(frequency, queue_len, x_pos, y_pos))
-            self.status_dataframe['frequency'][i] = frequency
-            self.status_dataframe['remain_buffer'][i] = queue_len
-            self.status_dataframe['pos_x'] = x_pos
-            self.status_dataframe['pos_y'] = y_pos
+            self.server_status['frequency'][i] = frequency
+            self.server_status['remain_buffer'][i] = queue_len
+            self.server_status['pos_x'] = x_pos
+            self.server_status['pos_y'] = y_pos
 
         # generate devices
         for i in range(self.device_num):
@@ -185,12 +195,25 @@ class ServerEnv(gym.Env):
             new_task = new_device.generate()
             self.devices.append(new_device)
             self.generated_tasks.append(new_task)
+            if new_task is not None:
+                self.task_status['size'][i] = new_task.size
+                self.task_status['delay'][i] = new_task.delay_constraint
+                self.task_status['pos_x'] = new_task.source.x
+                self.task_status['pos_y'] = new_task.source.y
 
-        return [self.status_dataframe, self.generated_tasks]
+        reward = torch.zeros(self.device_num)
+        self.nearest_servers_list = self.get_neatest_server()
+
+        if self.mode == 'all':
+            return [self.server_status, self.task_status]
+        elif self.mode == 'single':
+            return [self.server_status, self.task_status.iloc[0], reward]
 
     def step(self, action):
-        if self.mode == 'self':
+        if self.mode == 'all':
             return self.run_all_devices(action)
+        else:
+            return self.run_single_device(action)
 
     def run_all_devices(self, actions):
         """
@@ -202,6 +225,8 @@ class ServerEnv(gym.Env):
         reward = torch.zeros(self.device_num)
         for i in range(self.device_num):
             existing_task = self.generated_tasks[i]
+            if existing_task is None:
+                continue
             tasks_rejected_status, execution_time = self.servers[actions[i]].accept_task(existing_task)
             if not tasks_rejected_status:
                 # task is accepted
@@ -214,18 +239,87 @@ class ServerEnv(gym.Env):
                     existing_task.source.finished_delay += execution_time
             else:
                 existing_task.source.rejected_tasks_amount += 1
-
-        # reset the generated tasks list
-        self.generated_tasks = []
+                reward[i] = -1
 
         # run the servers and generate new tasks
         for i in range(self.server_num):
             working_server = self.servers[i]
             working_server.execute()
-            self.status_dataframe['remain_buffer'] = working_server.get_queue_state()
+            self.server_status['remain_buffer'] = working_server.get_queue_state()
 
+        # reset the generated tasks list
+        self.task_status = pd.DataFrame(columns=['size', 'delay', 'pos_x', 'pos_y'], index=self.indexes)
+        self.generated_tasks = []
         for i in range(self.device_num):
             task = self.devices[i].generate()
-            self.generated_tasks.append(task)
+            if task is not None:
+                self.generated_tasks.append(task)
+                if i == 0 or self.mode == 'all':
+                    self.task_status.iloc[i]['size'] = task.size
+                    self.task_status.iloc[i]['delay'] = task.delay_constraint
+                    self.task_status.iloc[i]['pos_x'] = task.source.x
+                    self.task_status.iloc[i]['pos_y'] = task.source.y
 
-        return [self.status_dataframe, self.generated_tasks]
+        return [self.server_status, self.task_status], reward
+
+    def run_single_device(self, action):
+        """
+        Execute the decision from a single device (default 0th device), and return the state of the environment.\n
+        :param action: action from the single device
+        :return: observation of the environment, and the reward
+        """
+        task_reject_state, execution_time, reward = None, 0, 0
+        for i in range(self.device_num):
+            task = self.generated_tasks[i]
+            if task is None:
+                continue
+            if i == 0:
+                task_reject_state, execution_time = self.servers[action].accept_task(task)
+            elif self.single_strategy == 'random':
+                task_reject_state, execution_time = self.servers[random.randint(0, self.server_num)].accept_task(task)
+            elif self.single_strategy == 'nearest':
+                task_reject_state, execution_time = self.servers[self.nearest_servers_list[i]].accept_task(task)
+
+            if not task_reject_state:
+                if execution_time > task.delay_constraint:
+                    reward = -1
+                    task.source.unfinished_tasks_amount += 1
+                else:
+                    reward = 1
+                    task.source.finished_tasks_amount += 1
+                    task.source.finished_delay += execution_time
+            else:
+                reward = -1
+                task.source.rejected_tasks_amount += 1
+
+        # execute
+        for i in range(self.server_num):
+            working_server = self.servers[i]
+            working_server.execute()
+            self.server_status['remain_buffer'] = working_server.get_queue_state()
+
+        self.generated_tasks = []
+        self.task_status = pd.DataFrame(columns=['size', 'delay', 'pos_x', 'pos_y'], index=self.indexes)
+        for i in range(self.device_num):
+            new_task = self.devices[i].generate()
+            if new_task is not None:
+                self.generated_tasks.append(new_task)
+                if i == 0:
+                    self.task_status.iloc[i]['size'] = new_task.size
+                    self.task_status.iloc[i]['delay'] = new_task.delay_constraint
+
+        return [self.server_status, self.task_status], reward
+
+    def get_neatest_server(self):
+        nearest_servers = []
+        for i in range(self.device_num):
+            n_server, n_server_idx = self.servers[0], 0
+            pos_x, pos_y = self.devices[i].x, self.devices[i].y
+            short_distance = (pos_x - n_server.x) ** 2 + (pos_y - n_server.y) ** 2
+            for j in range(self.server_num):
+                distance = (pos_x - self.servers[j].x) ** 2 + (pos_y - self.servers[j].y) ** 2
+                if distance < short_distance:
+                    short_distance = distance
+                    n_server_idx = j
+            nearest_servers.append(n_server_idx)
+        return nearest_servers
