@@ -3,6 +3,7 @@ import torch
 import numpy as np
 
 
-a = np.random.rand(4, 5)
-b = torch.as_tensor(a)
-print(b)
+a = torch.rand([64, 1])
+b = torch.rand([64, 3])
+c = torch.rand([64, 1])
+print((a / b) * c)

@@ -127,8 +127,8 @@ def all_mode():
         for i in range(device_num):
             replay_list[i].receive_trajectory_data(0.99)
             # prevent overfit due to short of data
-            if epoch < 10:
-                continue
+            # if epoch < 10:
+            #     continue
             agent_list[i].learn(replay_list[i])
         logging.debug('learning is ready, turn to test or next turn')
         if (epoch % 20) == 0:

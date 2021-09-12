@@ -156,24 +156,24 @@ class EligibilityTraceA2CAgent(Agent):
         for index, state in enumerate(states):
             # resize tensor to [1, n] to keep consistent with other algorithm without iterating arrays
             state_tensor = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
-            action_tensor = torch.as_tensor(actions[index], dtype=torch.float32).unsqueeze(0).to(self.device)
-            reward_tensor = torch.as_tensor(rewards[index], dtype=torch.float32).unsqueeze(0).to(self.device)
-            next_value_tensor = torch.as_tensor(next_value[index], dtype=torch.float32).unsqueeze(0).to(self.device)
+            action_tensor = torch.as_tensor(actions[index], dtype=torch.int64).view(-1, 1).to(self.device)
+            reward_tensor = torch.as_tensor(rewards[index], dtype=torch.float32).view(-1, 1).to(self.device)
+            next_value_tensor = torch.as_tensor(next_value[index], dtype=torch.float32).view(-1, 1).to(self.device)
 
             # update actor network parameters
-            u_tensor = reward_tensor + self.gamma * next_value_tensor
-            action_probs = self.act_model(state_tensor)
-            action_log_probs = torch.log(torch.clamp(action_probs, 1e-6, 1.))
+            u_tensor = (reward_tensor + self.gamma * next_value_tensor).view(-1)
+            action, action_prob = self.step(state_tensor)
+            action_log_probs = torch.log(torch.clamp(action_prob, 1e-6, 1.))
             psi_tensor = torch.gather(action_log_probs, 1, action_tensor)
 
             self.act_optimizer.zero_grad()
             psi_tensor.backward()
             pred_value = self.value_model(state_tensor)
-            pred_value_no_backward = pred_value.detach()
+            pred_value_no_backward = pred_value.detach().view(-1)
 
             for z_v, param in zip(z_act, self.act_model.parameters()):
                 z_v.data.copy_(self.gamma * self.p_lambda * z_v + I_value * param.grad)
-                param.grad.copy_(-(u_tensor - pred_value_no_backward) * self.alpha * z_v)
+                param.grad.copy_(-(u_tensor - pred_value_no_backward) * z_v)
 
             self.act_optimizer.step()
 
@@ -183,7 +183,7 @@ class EligibilityTraceA2CAgent(Agent):
 
             for z_v, param in zip(z_value, self.value_model.parameters()):
                 z_v.data.copy_(self.gamma * self.p_lambda * z_v + param.grad)
-                param.grad.copy_(-(u_tensor-pred_value_no_backward) * self.alpha * z_v)
+                param.grad.copy_(-(u_tensor-pred_value_no_backward) * z_v)
             self.value_optimizer.step()
 
 
@@ -194,15 +194,16 @@ class PPOAgent(Agent):
         self.epsilon, self.gamma, self.p_lambda = self.params
 
     def learn(self, rollout: rollouts.Replay):
-        states, actions, old_pis, advantages, returns = rollout.sample(batch_size=64)
+        states, actions, rewards, ends, action_probs, values, advantages, returns, next_value = rollout.sample(batch_size=64)
         state_tensor = torch.as_tensor(states, dtype=torch.float32).to(self.device)
         action_tensor = torch.as_tensor(actions, dtype=torch.long).to(self.device)
-        old_pi_tensor = torch.as_tensor(old_pis, dtype=torch.float32).to(self.device)
-        advantage_tensor = torch.as_tensor(advantages, dtype=torch.float32).to(self.device)
-        return_tensor = torch.as_tensor(returns, dtype=torch.float32).to(self.device)
+        action_probs_tensor = torch.as_tensor(action_probs, dtype=torch.float32).to(self.device)
+        advantage_tensor = torch.as_tensor(advantages, dtype=torch.float32).to(self.device).view(-1)
+        return_tensor = torch.as_tensor(returns, dtype=torch.float32).to(self.device).view(-1, 1)
 
-        new_pi_tensor = self.step(state_tensor)
-        pi_tensor = torch.gather(new_pi_tensor, 1, action_tensor.unsqueeze(1)).squeeze(1)
+        old_pi_tensor = torch.gather(action_probs_tensor, 1, action_tensor.view(-1, 1)).view(-1)
+        new_action, new_pi_tensor = self.step(state_tensor)
+        pi_tensor = torch.gather(new_pi_tensor, 1, new_action.unsqueeze(1)).squeeze(1)
         surrogate_advantage_tensor = (pi_tensor / old_pi_tensor) * advantage_tensor
         clip_advantage_tensor = 0.1 * surrogate_advantage_tensor
         max_surrogate_advantage_tensor = advantage_tensor + torch.where(advantage_tensor > 0., clip_advantage_tensor,
@@ -234,7 +235,7 @@ class TRPOAgent(Agent):
         advantage_tensor = torch.as_tensor(advantages, dtype=torch.float32).to(self.device)
         return_tensor = torch.as_tensor(returns, dtype=torch.float32).to(self.device)
 
-        new_pi_tensor = self.step(state_tensor)
+        action, new_pi_tensor = self.step(state_tensor)
         pi_tensor = torch.gather(new_pi_tensor, 1, action_tensor.unsqueeze(1)).squeeze(1)
         surrogate_tensor = (pi_tensor / old_pi_tensor) * advantage_tensor
         loss_tensor = surrogate_tensor.mean()
